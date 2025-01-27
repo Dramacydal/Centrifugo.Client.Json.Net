@@ -11,18 +11,13 @@ using Centrifugo.Client.Json.Protocol.PushTypes;
 using Centrifugo.Client.Json.Protocol.Requests;
 using Centrifugo.Client.Json.Protocol.Results;
 using Newtonsoft.Json.Linq;
+using NLog;
 using Websocket.Client;
 
 namespace Centrifugo.Client.Json;
 
 public class CentrifugoClient
 {
-    private readonly IWebsocketClient? _ws;
-
-    private string _token;
-
-    private string _name;
-
     private bool _authorized;
     
     private int _nextOperationId = 0;
@@ -32,6 +27,8 @@ public class CentrifugoClient
     private readonly ConcurrentDictionary<string, Subscription> _channels = new();
 
     private Subject<ConnectedEvent>? _connectedEventSource;
+    
+    private Subject<DisconnectedEvent>? _disconnectedEventSource;
 
     private Subject<MessageEvent>? _messageEventsSource;
 
@@ -42,12 +39,36 @@ public class CentrifugoClient
     private Subject<SubscribedEvent>? _subscribedEventsSource;
     
     private Subject<UnsubscribedEvent>? _unsubscribedEventsSource;
+
+    private CancellationToken _cancellationToken;
+
+    private Task? _pingRunner;
+
+    private readonly IWebsocketClient? _ws;
+
+    private string _token;
+
+    private string _name;
     
+    private PingMethod _pingMethod;
+
+    private ProtocolVersion _protocolVersion;
+    
+    private readonly ILogger? _logger;
+    
+    private readonly ClientSettings _settings;
+
     public CentrifugoClient(ClientSettings settings)
     {
+        if (settings.WebsocketClient == null)
+            throw new CentrifugoException("WebSocket parameter must be set");
+        
         _ws = settings.WebsocketClient;
         _pingMethod = settings.PingMethod;
         _protocolVersion = settings.ProtocolVersion;
+        _logger = settings.Logger;
+        _settings = settings;
+        
         // _ws.IsTextMessageConversionEnabled = false;
         
         HandleConnection();
@@ -95,6 +116,18 @@ public class CentrifugoClient
         _connectedEventSource.Subscribe(handler);
     }
     
+    public void OnDisconnect(Func<DisconnectedEvent, Task> handler)
+    {
+        _disconnectedEventSource ??= new();
+        _disconnectedEventSource.SubscribeAsync(handler);
+    }
+
+    public void OnDisconnect(Action<DisconnectedEvent> handler)
+    {
+        _disconnectedEventSource ??= new();
+        _disconnectedEventSource.Subscribe(handler);
+    }
+    
     public void OnPing(Func<PingEvent, Task> handler)
     {
         _pingEventsSource ??= new();
@@ -136,14 +169,14 @@ public class CentrifugoClient
     private void HandleConnection()
     {
         // reconnect -> auth and resub: _channels
-        _ws.ReconnectionHappened.SubscribeAsync(r =>
+        _ws.ReconnectionHappened.SubscribeAsync(async r =>
         {
-            //_clientId = null;
+            _logger?.Debug($"Websocket reconnection happened: {r.Type}");
 
             switch (r.Type)
             {
                 case ReconnectionType.Initial:
-                    break;
+                    return;
                 case ReconnectionType.Lost:
                     break;
                 case ReconnectionType.NoMessageReceived:
@@ -158,6 +191,24 @@ public class CentrifugoClient
                 default:
                     throw new ArgumentOutOfRangeException();
             }
+
+            try
+            {
+                _logger?.Debug("Reconnecting to centrifugo");
+                _authorized = false;
+                await ConnectAsync(_cancellationToken);
+            }
+            catch (Exception ex)
+            {
+                _logger?.Error(
+                    $"Failed to connect centrifugo after websocket reconnection, {ex.GetType()}: {ex.Message}");
+            }
+        });
+
+        _ws.DisconnectionHappened.SubscribeAsync(d =>
+        {
+            _logger?.Debug($"Websocket disconnection happened: {d.Type}, description: \"{d.CloseStatusDescription}\"");
+            _disconnectedEventSource?.OnNext(new DisconnectedEvent() { Info = d });
 
             return Task.CompletedTask;
         });
@@ -193,7 +244,7 @@ public class CentrifugoClient
                     case ' ':
                         continue;
                     default:
-                        throw new Exception("Bad json");
+                        throw new CentrifugoException("Bad json");
                 }
             }
 
@@ -218,10 +269,9 @@ public class CentrifugoClient
         _ws.MessageReceived.SubscribeAsync(
             async response =>
             {
-                Console.WriteLine();
-                Console.WriteLine("------------------------- frame start -------------------------");
-                Console.WriteLine(response.Text);
-                Console.WriteLine("-------------------------- frame end --------------------------");
+                _logger?.Trace("------------------------- frame start -------------------------");
+                _logger?.Trace(response.Text);
+                _logger?.Trace("-------------------------- frame end --------------------------");
 
                 // var parts = ExtractParts(response.Text);
                 var parts = response.Text.Split('\n').Select(l => l.Trim());
@@ -235,7 +285,7 @@ public class CentrifugoClient
                     catch (Exception e)
                     {
                         _errorEventsSource?.OnNext(new ErrorEvent() { Exception = e });
-                        Console.WriteLine(e);
+                        _logger?.Error($"Failed to deserialize json, {e.GetType()}: {e.Message}");
                         return;
                     }
 
@@ -300,13 +350,15 @@ public class CentrifugoClient
                                 );
                                 break;
                         }
+                        
+                        _logger?.Error($"Received centrifugo error, {reply.Error.Code}: {reply.Error.Message}");
 
                         _errorEventsSource?.OnNext(new ErrorEvent { Data = reply.Error });
                     }
                     else if (reply.Result != null && reply.Result.Count > 0)
                     {
                         if (reply.GuessVersion() != _protocolVersion)
-                            throw new Exception("Reply and protocol version mismatch");
+                            throw new ProtocolMismatchException("Reply and protocol version mismatch");
 
                         if (reply.Id == 0) // если 0, то это push
                         {
@@ -381,7 +433,7 @@ public class CentrifugoClient
                     else if (reply.HasInlineData)
                     {
                         if (reply.GuessVersion() != _protocolVersion)
-                            throw new Exception("Reply and protocol version mismatch");
+                            throw new ProtocolMismatchException("Reply and protocol version mismatch");
 
                         if (reply.Id == 0) // если 0, то это push
                         {
@@ -451,14 +503,6 @@ public class CentrifugoClient
         _name = name;
     }
 
-    private CancellationToken _cancellationToken;
-
-    private Task? _pingRunner;
-    
-    private PingMethod _pingMethod;
-
-    private ProtocolVersion _protocolVersion;
-
     public async Task ConnectAsync(CancellationToken cancellationToken = default)
     {
         if (_ws?.NativeClient?.State == WebSocketState.Open && _authorized)
@@ -505,13 +549,17 @@ public class CentrifugoClient
         {
             await Task.Delay(TimeSpan.FromSeconds(25), _cancellationToken);
 
+            if (!_authorized)
+                continue;
+            
             try
             {
                 await PingAsync();
             }
-            catch (Exception ex)
+            catch (Exception e)
             {
-                _errorEventsSource?.OnNext(new ErrorEvent { Exception = ex });
+                _logger?.Error($"Failed to send ping, {e.GetType()}: {e.Message}");
+                _errorEventsSource?.OnNext(new ErrorEvent { Exception = e });
             }
         }
     }
@@ -533,20 +581,20 @@ public class CentrifugoClient
             return await NullTaskResult.NotConnected<V>();
 
         if (command.GuessVersion() != _protocolVersion)
-            throw new Exception("Command and protocol versions mismatch.");
+            throw new ProtocolMismatchException("Command and protocol versions mismatch.");
         
         // not awaitable
         if (command.Method == MethodType.Send || command.Send != null)
         {
             var strCommand = JsonHelper.Serialize(command);
-            Console.WriteLine(strCommand);
+            _logger?.Trace(strCommand);
             _ws.Send(strCommand);
 
             return await NullTaskResult.Instance<V>();
         }
 
         if (command.Id == default)
-            throw new Exception("Command id cannot be empty");
+            throw new CentrifugoException("Command id cannot be empty");
 
         var tcs = new TaskCompletionSource<JObject>(TaskCreationOptions.RunContinuationsAsynchronously);
 
@@ -558,7 +606,7 @@ public class CentrifugoClient
         });
         
         var strCommand2 = JsonHelper.Serialize(command);
-        Console.WriteLine(strCommand2);
+        _logger?.Trace(strCommand2);
         _ws.Send(strCommand2);
 
         var obj = await tcs.Task;
@@ -575,14 +623,14 @@ public class CentrifugoClient
         {
             subscription.State = SubscriptionState.SubscriptionError;
 
-            throw new Exception("Client not conected");
+            throw new CentrifugoException("Client not connected");
         }
 
         if (!_authorized)
         {
             subscription.State = SubscriptionState.SubscriptionError;
 
-            throw new Exception("Not authorized");
+            throw new CentrifugoException("Not authorized");
         }
 
         // var offset = subscription.Offset;
@@ -624,14 +672,8 @@ public class CentrifugoClient
         }
         catch (CentrifugoException e)
         {
+            _logger?.Error($"Failed to subscribe, {e.GetType()}: {e.Message}");
             subscription.State = SubscriptionState.SubscriptionError;
-
-            _errorEventsSource?.OnNext(new ErrorEvent()
-            {
-                Subscription = subscription,
-                Exception = e
-            });
-
             throw;
         }
     }
@@ -672,19 +714,13 @@ public class CentrifugoClient
             }
             catch (Exception e)
             {
+                _logger?.Error($"Failed to unsubscribe, {e.GetType()}: {e.Message}");
                 subscription.State = SubscriptionState.UnsubscriptionError;
-
-                _errorEventsSource?.OnNext(new ErrorEvent()
-                {
-                    Subscription = subscription,
-                    Exception = e
-                });
-
                 throw;
             }
         }
     }
-    
+
     public async Task PublishAsync(string channel, JObject payload)
     {
         var publishCommand = new Command<PublishRequest, PublishResult>
@@ -724,6 +760,9 @@ public class CentrifugoClient
 
         _connectedEventSource?.OnCompleted();
         _connectedEventSource?.Dispose();
+        
+        _disconnectedEventSource?.OnCompleted();
+        _disconnectedEventSource?.Dispose();
 
         _messageEventsSource?.OnCompleted();
         _messageEventsSource?.Dispose();
@@ -735,7 +774,7 @@ public class CentrifugoClient
         _pingEventsSource?.Dispose();
         
         _subscribedEventsSource?.OnCompleted();
-        _subscribedEventsSource?.Dispose();
+        _subscribedEventsSource?.Dispose(); 
         
         _unsubscribedEventsSource?.OnCompleted();
         _unsubscribedEventsSource?.Dispose();
@@ -743,7 +782,7 @@ public class CentrifugoClient
         foreach (var taskCompletionSource in _operations)
         {
             // TODO: custom exception
-            taskCompletionSource.Value.TrySetException(new Exception("Client disposed."));
+            taskCompletionSource.Value.TrySetException(new CentrifugoException("Client disposed."));
         }
         _operations.Clear();
 

@@ -9,7 +9,7 @@ public static class JsonHelper
 {
     private static readonly JsonSerializerSettings _settings;
 
-    public class ShouldSerializeContractResolver : DefaultContractResolver
+    class ShouldSerializeContractResolver : DefaultContractResolver
     {
         protected override JsonProperty CreateProperty(MemberInfo member, MemberSerialization memberSerialization)
         {
